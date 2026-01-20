@@ -12,7 +12,7 @@ if sys.version_info[0] < 3:
 # click
 try:
     import click
-except:
+except ImportError:
     print('\033[91mERROR:\033[0m', 'click is not installed.')
     sys.exit()
 
@@ -21,13 +21,13 @@ try:
     import plexapi.utils
     from plexapi.server import PlexServer
     from plexapi.exceptions import BadRequest
-except:
+except ImportError:
     print('\033[91mERROR:\033[0m', 'plexapi is not installed.')
     sys.exit()
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = 0.1
+VERSION = 0.2
 
 # plex
 class Plex():
@@ -75,36 +75,46 @@ class Plex():
         if self.library.type == 'movie':
             for media in item.media:
                 for part in media.parts:
-                    return part.file.rsplit('/', 1)[0]
+                    return os.path.dirname(part.file)
         elif self.library.type == 'show':
             for episode in item.episodes():
                 for media in episode.media:
                     for part in media.parts:
                         if season:
-                            return part.file.rsplit('/', 1)[0]
-                        return part.file.rsplit('/', 2)[0]
+                            # Returns the folder containing the episode (e.g., "Season 01")
+                            return os.path.dirname(part.file)
+                        # Returns the Show folder (parent of Season folder)
+                        return os.path.dirname(os.path.dirname(part.file))
 
     def download(self, url=None, filename=None, path=None):
-        path = path.lstrip('/')
-        abs_path = os.path.join(self.output_path, path)
+        # Handle cases where path might be absolute or relative
+        if self.output_path == '/': 
+            # If default, use the actual path from Plex
+            abs_path = path
+        else:
+            # If user specified an override path (dry run logic), join them
+            path = path.lstrip('/')
+            abs_path = os.path.join(self.output_path, path)
 
         if not self.overwrite and os.path.isfile(os.path.join(abs_path, filename)):
             if self.verbose:
                 print('\033[93mSKIPPED:\033[0m', os.path.join(abs_path, filename))
             self.skipped += 1
         else:
+            if not os.path.exists(abs_path):
+                try:
+                    os.makedirs(abs_path)
+                except:
+                    pass
+            
             if plexapi.utils.download(self.server._baseurl+url, self.token, filename=filename, savepath=abs_path):
                 if self.verbose:
                     print('\033[92mDOWNLOADED:\033[0m', os.path.join(abs_path, filename))
                 self.downloaded += 1
             else:
                 print('\033[91mDOWNLOAD FAILED:\033[0m', os.path.join(abs_path, filename))
-                sys.exit()
-
-
-
-
-
+                # Don't exit on single fail, just print error
+                pass 
 
 # main
 @click.command(context_settings=dict(help_option_names=['-h', '--help']))
@@ -113,7 +123,7 @@ class Plex():
 @click.option('--token', prompt='Plex Token', help='The authentication token for Plex.', required=True)
 @click.option('--library', help='The Plex library name.',)
 @click.option('--assets', help='Which assets should be exported?', type=click.Choice(['all', 'posters', 'backgrounds', 'banners', 'themes']), default='all')
-@click.option('--output-path', default='/', help='The output path for the downloaded assets. Change to a hardcoded location to run script as a sort of dry run.')
+@click.option('--output-path', default='/', help='The output path for the downloaded assets. Leave default to save directly to media folders.')
 @click.option('--overwrite', help='Overwrite existing assets?', is_flag=True)
 @click.option('--verbose', help='Show extra information?', is_flag=True)
 @click.pass_context
@@ -131,33 +141,56 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, overwrite: bo
         if verbose:
             print('\n\033[94mITEM:\033[0m', item.title)
 
-        path = plex.getPath(item)
-        if path == None:
-            print('\033[91mERROR:\033[0m', 'failed to extract the path.')
-            sys.exit()
+        try:
+            path = plex.getPath(item)
+            if path is None:
+                print(f'\033[93mWARNING:\033[0m Could not determine path for {item.title}, skipping.')
+                continue
 
-        if (assets == 'all' or assets == 'posters') and hasattr(item, 'thumb') and item.thumb != None:
-            plex.download(item.thumb, 'poster.jpg', path)
-        if (assets == 'all' or assets == 'backgrounds') and hasattr(item, 'art') and item.art != None:
-            plex.download(item.art, 'background.jpg', path)
-        if (assets == 'all' or assets == 'banners') and hasattr(item, 'banner') and item.banner != None:
-            plex.download(item.banner, 'banner.jpg', path)
-        if (assets == 'all' or assets == 'themes') and hasattr(item, 'theme') and item.theme != None:
-            plex.download(item.theme, 'theme.mp3', path)
+            # --- Movie / Show Level Assets ---
+            if (assets == 'all' or assets == 'posters') and hasattr(item, 'thumb') and item.thumb:
+                plex.download(item.thumb, 'poster.jpg', path)
+            
+            # Renamed 'background.jpg' to 'fanart.jpg' for better Jellyfin support
+            if (assets == 'all' or assets == 'backgrounds') and hasattr(item, 'art') and item.art:
+                plex.download(item.art, 'fanart.jpg', path)
+            
+            if (assets == 'all' or assets == 'banners') and hasattr(item, 'banner') and item.banner:
+                plex.download(item.banner, 'banner.jpg', path)
+            
+            if (assets == 'all' or assets == 'themes') and hasattr(item, 'theme') and item.theme:
+                plex.download(item.theme, 'theme.mp3', path)
 
-        if plex.library.type == 'show':
-            for season in item.seasons():
-                path = plex.getPath(season, True)
-                if path == None:
-                    print('\033[91mERROR:\033[0m', 'failed to extract the path.')
-                    sys.exit()
+            # --- TV Show Specific Logic ---
+            if plex.library.type == 'show':
+                for season in item.seasons():
+                    # Get path to the season folder (e.g. /TV/Show/Season 1)
+                    season_path = plex.getPath(season, True)
+                    
+                    if season_path:
+                        # 1. Season Posters
+                        # We save as 'folder.jpg' inside the season folder so Jellyfin sees it as the season cover
+                        if (assets == 'all' or assets == 'posters') and hasattr(season, 'thumb') and season.thumb:
+                            plex.download(season.thumb, 'folder.jpg', season_path)
 
-                # TODO: Add backgrounds for seasons?
-                # if (assets == 'all' or assets == 'backgrounds') and hasattr(season, 'art') and season.art != None and season.title != None:
-                #     plex.download(season.art, (season.title+'-background' if season.title != 'Specials' else 'season-specials-background')+'.jpg', path)
-                # TODO: Add banners for seasons?
-                # if (assets == 'all' or assets == 'banners') and hasattr(season, 'banner') and season.banner != None and season.title != None:
-                #     plex.download(season.banner, (season.title+'-banner' if season.title != 'Specials' else 'season-specials-banner')+'.jpg', path)
+                        # 2. Episode Thumbnails
+                        # We iterate episodes to put thumbs next to files
+                        for episode in season.episodes():
+                            if (assets == 'all' or assets == 'posters') and hasattr(episode, 'thumb') and episode.thumb:
+                                for media in episode.media:
+                                    for part in media.parts:
+                                        # Construct filename-thumb.jpg based on the video filename
+                                        video_dir = os.path.dirname(part.file)
+                                        video_filename = os.path.splitext(os.path.basename(part.file))[0]
+                                        thumb_name = f"{video_filename}-thumb.jpg"
+                                        
+                                        # Download
+                                        plex.download(episode.thumb, thumb_name, video_dir)
+                                        # Break after first part found to avoid duplicates for multi-part episodes
+                                        break 
+
+        except Exception as e:
+            print(f'\033[91mERROR Processing {item.title}:\033[0m {e}')
 
     if verbose:
         print('\n\033[94mTOTAL SKIPPED:\033[0m', str(plex.skipped))
