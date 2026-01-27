@@ -2,6 +2,7 @@
 
 import os
 import sys
+import datetime
 
 # sys
 sys.dont_write_bytecode = True
@@ -27,17 +28,17 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = 0.2
+VERSION = 0.3
 
 # plex
 class Plex():
-    def __init__(self, baseurl=None, token=None, library=None, overwrite=False, verbose=False, output_path=None):
+    def __init__(self, baseurl=None, token=None, library=None, force=False, verbose=False, output_path=None):
         self.baseurl = baseurl
         self.token = token
         self.server = None
         self.libraries = []
         self.library = library
-        self.overwrite = overwrite
+        self.force = force
         self.verbose = verbose
         self.output_path = output_path
         self.downloaded = 0
@@ -81,40 +82,61 @@ class Plex():
                 for media in episode.media:
                     for part in media.parts:
                         if season:
-                            # Returns the folder containing the episode (e.g., "Season 01")
                             return os.path.dirname(part.file)
-                        # Returns the Show folder (parent of Season folder)
                         return os.path.dirname(os.path.dirname(part.file))
 
-    def download(self, url=None, filename=None, path=None):
-        # Handle cases where path might be absolute or relative
+    def download(self, url=None, filename=None, path=None, source_updated_at=None):
+        # source_updated_at: datetime object from Plex indicating when the item was last changed
+        
         if self.output_path == '/': 
-            # If default, use the actual path from Plex
             abs_path = path
         else:
-            # If user specified an override path (dry run logic), join them
             path = path.lstrip('/')
             abs_path = os.path.join(self.output_path, path)
 
-        if not self.overwrite and os.path.isfile(os.path.join(abs_path, filename)):
+        if not os.path.exists(abs_path):
+            try:
+                os.makedirs(abs_path)
+            except:
+                pass
+
+        final_file_path = os.path.join(abs_path, filename)
+        should_download = True
+
+        # SMART SYNC LOGIC
+        if os.path.isfile(final_file_path):
+            if self.force:
+                should_download = True
+            elif source_updated_at:
+                # Get local file modified time
+                local_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(final_file_path))
+                
+                # Check if Plex item is newer than local file
+                # We add a small buffer (1 minute) to avoid time-zone weirdness or slight clock drifts
+                if source_updated_at > (local_mtime + datetime.timedelta(seconds=1)):
+                    should_download = True
+                    if self.verbose:
+                        print(f"  [UPDATE DETECTED] Plex: {source_updated_at} > Local: {local_mtime}")
+                else:
+                    should_download = False
+            else:
+                # If no timestamp provided and file exists (and not forced), skip
+                should_download = False
+
+        if not should_download:
             if self.verbose:
-                print('\033[93mSKIPPED:\033[0m', os.path.join(abs_path, filename))
+                print('\033[93mSKIPPED (Current):\033[0m', final_file_path)
             self.skipped += 1
         else:
-            if not os.path.exists(abs_path):
-                try:
-                    os.makedirs(abs_path)
-                except:
-                    pass
-            
-            if plexapi.utils.download(self.server._baseurl+url, self.token, filename=filename, savepath=abs_path):
-                if self.verbose:
-                    print('\033[92mDOWNLOADED:\033[0m', os.path.join(abs_path, filename))
-                self.downloaded += 1
-            else:
-                print('\033[91mDOWNLOAD FAILED:\033[0m', os.path.join(abs_path, filename))
-                # Don't exit on single fail, just print error
-                pass 
+            try:
+                if plexapi.utils.download(self.server._baseurl+url, self.token, filename=filename, savepath=abs_path):
+                    if self.verbose:
+                        print('\033[92mDOWNLOADED:\033[0m', final_file_path)
+                    self.downloaded += 1
+                else:
+                    print('\033[91mDOWNLOAD FAILED:\033[0m', final_file_path)
+            except Exception as e:
+                print(f'\033[91mERROR:\033[0m {e}')
 
 # main
 @click.command(context_settings=dict(help_option_names=['-h', '--help']))
@@ -123,16 +145,16 @@ class Plex():
 @click.option('--token', prompt='Plex Token', help='The authentication token for Plex.', required=True)
 @click.option('--library', help='The Plex library name.',)
 @click.option('--assets', help='Which assets should be exported?', type=click.Choice(['all', 'posters', 'backgrounds', 'banners', 'themes']), default='all')
-@click.option('--output-path', default='/', help='The output path for the downloaded assets. Leave default to save directly to media folders.')
-@click.option('--overwrite', help='Overwrite existing assets?', is_flag=True)
+@click.option('--output-path', default='/', help='The output path for the downloaded assets.')
+@click.option('--force', help='Force overwrite of all assets regardless of timestamp?', is_flag=True)
 @click.option('--verbose', help='Show extra information?', is_flag=True)
 @click.pass_context
-def main(ctx, baseurl: str, token: str, library: str, assets: str, overwrite: bool, verbose: bool, output_path: str):
-    plex = Plex(baseurl, token, library, overwrite, verbose, output_path)
+def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, verbose: bool, output_path: str):
+    plex = Plex(baseurl, token, library, force, verbose, output_path)
 
     if verbose:
         print('\033[94mASSETS:\033[0m', assets)
-        print('\033[94mOVERWRITE:\033[0m', str(overwrite))
+        print('\033[94mFORCE OVERWRITE:\033[0m', str(force))
         print('\nGetting library items...')
 
     items = plex.getAll()
@@ -144,49 +166,47 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, overwrite: bo
         try:
             path = plex.getPath(item)
             if path is None:
-                print(f'\033[93mWARNING:\033[0m Could not determine path for {item.title}, skipping.')
                 continue
 
-            # --- Movie / Show Level Assets ---
+            # Grab the Last Modified Timestamp from Plex
+            # This updates whenever Kometa runs or you change metadata
+            item_updated = item.updatedAt 
+
+            # MOVIE / SHOW ASSETS
             if (assets == 'all' or assets == 'posters') and hasattr(item, 'thumb') and item.thumb:
-                plex.download(item.thumb, 'poster.jpg', path)
+                plex.download(item.thumb, 'poster.jpg', path, item_updated)
             
-            # Renamed 'background.jpg' to 'fanart.jpg' for better Jellyfin support
             if (assets == 'all' or assets == 'backgrounds') and hasattr(item, 'art') and item.art:
-                plex.download(item.art, 'fanart.jpg', path)
+                plex.download(item.art, 'fanart.jpg', path, item_updated)
             
             if (assets == 'all' or assets == 'banners') and hasattr(item, 'banner') and item.banner:
-                plex.download(item.banner, 'banner.jpg', path)
+                plex.download(item.banner, 'banner.jpg', path, item_updated)
             
             if (assets == 'all' or assets == 'themes') and hasattr(item, 'theme') and item.theme:
-                plex.download(item.theme, 'theme.mp3', path)
+                plex.download(item.theme, 'theme.mp3', path, item_updated)
 
-            # --- TV Show Specific Logic ---
+            # TV SPECIFIC
             if plex.library.type == 'show':
                 for season in item.seasons():
-                    # Get path to the season folder (e.g. /TV/Show/Season 1)
                     season_path = plex.getPath(season, True)
-                    
-                    if season_path:
-                        # 1. Season Posters
-                        # We save as 'folder.jpg' inside the season folder so Jellyfin sees it as the season cover
-                        if (assets == 'all' or assets == 'posters') and hasattr(season, 'thumb') and season.thumb:
-                            plex.download(season.thumb, 'folder.jpg', season_path)
+                    # Seasons have their own updated time
+                    season_updated = season.updatedAt if hasattr(season, 'updatedAt') else item_updated
 
-                        # 2. Episode Thumbnails
-                        # We iterate episodes to put thumbs next to files
+                    if season_path:
+                        if (assets == 'all' or assets == 'posters') and hasattr(season, 'thumb') and season.thumb:
+                            plex.download(season.thumb, 'folder.jpg', season_path, season_updated)
+
                         for episode in season.episodes():
+                            episode_updated = episode.updatedAt if hasattr(episode, 'updatedAt') else season_updated
+                            
                             if (assets == 'all' or assets == 'posters') and hasattr(episode, 'thumb') and episode.thumb:
                                 for media in episode.media:
                                     for part in media.parts:
-                                        # Construct filename-thumb.jpg based on the video filename
                                         video_dir = os.path.dirname(part.file)
                                         video_filename = os.path.splitext(os.path.basename(part.file))[0]
                                         thumb_name = f"{video_filename}-thumb.jpg"
                                         
-                                        # Download
-                                        plex.download(episode.thumb, thumb_name, video_dir)
-                                        # Break after first part found to avoid duplicates for multi-part episodes
+                                        plex.download(episode.thumb, thumb_name, video_dir, episode_updated)
                                         break 
 
         except Exception as e:
