@@ -21,14 +21,14 @@ except ImportError:
 try:
     import plexapi.utils
     from plexapi.server import PlexServer
-    from plexapi.exceptions import BadRequest
+    from plexapi.exceptions import BadRequest, NotFound
 except ImportError:
     print('\033[91mERROR:\033[0m', 'plexapi is not installed.')
     sys.exit()
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = 0.3
+VERSION = 0.4
 
 # plex
 class Plex():
@@ -86,8 +86,9 @@ class Plex():
                         return os.path.dirname(os.path.dirname(part.file))
 
     def download(self, url=None, filename=None, path=None, source_updated_at=None):
-        # source_updated_at: datetime object from Plex indicating when the item was last changed
-        
+        if not url:
+            return
+
         if self.output_path == '/': 
             abs_path = path
         else:
@@ -108,19 +109,15 @@ class Plex():
             if self.force:
                 should_download = True
             elif source_updated_at:
-                # Get local file modified time
                 local_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(final_file_path))
-                
-                # Check if Plex item is newer than local file
-                # We add a small buffer (1 minute) to avoid time-zone weirdness or slight clock drifts
-                if source_updated_at > (local_mtime + datetime.timedelta(seconds=1)):
+                # 1 minute buffer for clock drift
+                if source_updated_at > (local_mtime + datetime.timedelta(seconds=60)):
                     should_download = True
                     if self.verbose:
                         print(f"  [UPDATE DETECTED] Plex: {source_updated_at} > Local: {local_mtime}")
                 else:
                     should_download = False
             else:
-                # If no timestamp provided and file exists (and not forced), skip
                 should_download = False
 
         if not should_download:
@@ -129,12 +126,16 @@ class Plex():
             self.skipped += 1
         else:
             try:
-                if plexapi.utils.download(self.server._baseurl+url, self.token, filename=filename, savepath=abs_path):
+                # Using the server baseurl + url logic manually to handle 404s better
+                full_url = self.server._baseurl + url
+                if plexapi.utils.download(full_url, self.token, filename=filename, savepath=abs_path):
                     if self.verbose:
                         print('\033[92mDOWNLOADED:\033[0m', final_file_path)
                     self.downloaded += 1
                 else:
-                    print('\033[91mDOWNLOAD FAILED:\033[0m', final_file_path)
+                    print('\033[91mDOWNLOAD FAILED (Generic):\033[0m', final_file_path)
+            except NotFound:
+                print(f'\033[91mNOT FOUND (404):\033[0m Plex cannot find the asset file for {filename}.')
             except Exception as e:
                 print(f'\033[91mERROR:\033[0m {e}')
 
@@ -160,6 +161,13 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
     items = plex.getAll()
 
     for item in items:
+        # CRITICAL FIX: Reload the item to get the freshest URLs and timestamps
+        try:
+            item.reload()
+        except Exception:
+            # If we can't reload (item deleted while script was running), skip it
+            continue
+
         if verbose:
             print('\n\033[94mITEM:\033[0m', item.title)
 
@@ -168,8 +176,6 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
             if path is None:
                 continue
 
-            # Grab the Last Modified Timestamp from Plex
-            # This updates whenever Kometa runs or you change metadata
             item_updated = item.updatedAt 
 
             # MOVIE / SHOW ASSETS
@@ -189,7 +195,6 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
             if plex.library.type == 'show':
                 for season in item.seasons():
                     season_path = plex.getPath(season, True)
-                    # Seasons have their own updated time
                     season_updated = season.updatedAt if hasattr(season, 'updatedAt') else item_updated
 
                     if season_path:
