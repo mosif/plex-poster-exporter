@@ -39,7 +39,7 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = 0.7
+VERSION = '0.10'
 
 VALID_EXPORT_TYPES = {'local', 'rclone'}
 
@@ -48,20 +48,23 @@ VALID_EXPORT_TYPES = {'local', 'rclone'}
 class Plex():
     def __init__(self, baseurl=None, token=None, library=None, force=False, verbose=False,
                  output_path=None, dry_run=False, mirror=False, cache_path=None,
-                 export_types=None, rclone_dest=None):
+                 export_types=None, rclone_dest=None, force_hash=False, rclone_config=None):
         self.baseurl = baseurl
         self.token = token
         self.server = None
         self.libraries = []
         self.library = library
         self.force = force
-        self.mirror = mirror
+        self.force_hash = force_hash
+        # --force-hash implies --mirror so the hash branch is reachable
+        self.mirror = mirror or force_hash
         self.verbose = verbose
         self.output_path = output_path
         self.dry_run = dry_run
         self.cache_path = cache_path
         self.export_types = export_types or ['local']
         self.rclone_dest = rclone_dest
+        self.rclone_config = rclone_config
         self.downloaded = 0
         self.skipped = 0
         self.errors = 0
@@ -175,21 +178,51 @@ class Plex():
             pass
 
     def _decide_local_action(self, local_path, source_updated_at):
-        """Returns 'download' (missing/force/timestamp-newer), 'mirror' (mirror mode), or 'skip'."""
+        """Decide what to do for the local target.
+        Returns 'download' (missing/force/Plex-newer), 'mirror' (hash-verify), or 'skip'.
+
+        Mirror behavior tiers (cheapest first):
+          - Plex's updatedAt is newer than local mtime → straight download, no hash.
+          - --force-hash → hash-verify regardless of mtime (audit / post-restore).
+          - Local mtime has drifted past Plex's updatedAt → hash-verify (catches Jellyfin
+            overwrites, manual edits, etc.).
+          - Otherwise local mtime matches Plex's expected state → skip without reading
+            the file's bytes.
+
+        We set local mtime = Plex updatedAt after every successful write, so the
+        "matches" case skips on a stat alone — no NAS read of contents.
+        """
         if not os.path.isfile(local_path):
             if self.verbose:
                 print(f'  [MISSING] {local_path}')
             return 'download'
         if self.force:
             return 'download'
-        if self.mirror:
-            return 'mirror'
+
+        grace = datetime.timedelta(seconds=60)
+        local_mtime = None
+
         if source_updated_at:
             local_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(local_path))
-            if source_updated_at > (local_mtime + datetime.timedelta(seconds=60)):
+            if source_updated_at > (local_mtime + grace):
                 if self.verbose:
-                    print(f'  [UPDATE DETECTED] Plex: {source_updated_at} > Local: {local_mtime}')
+                    print(f'  [PLEX NEWER] Plex: {source_updated_at} > Local: {local_mtime}')
                 return 'download'
+
+        # File exists, Plex isn't newer.
+        if self.force_hash:
+            if self.verbose:
+                print(f'  [FORCE HASH] verifying {local_path}')
+            return 'mirror'
+
+        if self.mirror:
+            if source_updated_at is None:
+                return 'mirror'
+            if local_mtime is not None and local_mtime > (source_updated_at + grace):
+                if self.verbose:
+                    print(f'  [LOCAL DRIFT] Local: {local_mtime} > Plex: {source_updated_at} — verifying hash')
+                return 'mirror'
+
         return 'skip'
 
     def _download_to_cache(self, url, filename):
@@ -222,7 +255,7 @@ class Plex():
             self._safe_remove(cache_file)
             return None
 
-    def _apply_local(self, cache_file, local_path, action):
+    def _apply_local(self, cache_file, local_path, action, source_updated_at=None):
         """Place cache_file at local_path according to action. Returns True if a write occurred."""
         local_dir = os.path.dirname(local_path)
         file_existed = os.path.isfile(local_path)
@@ -236,6 +269,9 @@ class Plex():
 
         if action == 'mirror' and file_existed:
             if self._files_equal(cache_file, local_path):
+                # Hash matched — no write needed. But realign mtime so the next run can
+                # detect "untouched" via mtime alone and skip the hash entirely.
+                self._align_mtime(local_path, source_updated_at)
                 if self.verbose:
                     print('\033[93mLOCAL SKIPPED (Matches):\033[0m', local_path)
                 return False
@@ -243,6 +279,9 @@ class Plex():
         try:
             # copy2 works across filesystems (cache on SSD → target on NAS) and preserves mtime
             shutil.copy2(cache_file, local_path)
+            # Align local mtime with Plex's updatedAt so future runs can cheaply detect
+            # external modification (local mtime > Plex updatedAt == something touched it).
+            self._align_mtime(local_path, source_updated_at)
             if self.verbose:
                 if action == 'mirror' and file_existed:
                     label = 'LOCAL REPLACED (Differs)'
@@ -256,9 +295,22 @@ class Plex():
             print(f'\033[91mLOCAL WRITE ERROR:\033[0m {e}')
             return False
 
+    @staticmethod
+    def _align_mtime(path, source_updated_at):
+        if not source_updated_at:
+            return
+        try:
+            epoch = source_updated_at.timestamp()
+            os.utime(path, (epoch, epoch))
+        except Exception:
+            pass
+
     def _apply_rclone(self, cache_file, rclone_path):
         """Upload cache_file to rclone_path using `rclone copyto`. Returns True on success."""
-        cmd = ['rclone', 'copyto']
+        cmd = ['rclone']
+        if self.rclone_config:
+            cmd.extend(['--config', self.rclone_config])
+        cmd.append('copyto')
         if not self.force:
             # --checksum makes rclone compare hashes (Google Drive stores MD5) and skip if equal
             cmd.append('--checksum')
@@ -346,7 +398,7 @@ class Plex():
         did_work = False
         try:
             if local_path and local_action in ('download', 'mirror'):
-                if self._apply_local(cache_file, local_path, local_action):
+                if self._apply_local(cache_file, local_path, local_action, source_updated_at):
                     did_work = True
             if rclone_path:
                 if self._apply_rclone(cache_file, rclone_path):
@@ -372,19 +424,24 @@ class Plex():
               help='Comma-separated targets: local, rclone, or local,rclone. Default: local.')
 @click.option('--rclone-dest', default=None,
               help='rclone destination prefix (e.g., gdrive:JellyfinPosters/TV). The library-relative path is appended. Required when --export-type includes rclone.')
+@click.option('--rclone-config', default=None,
+              help='Path to a custom rclone config file (passed as `rclone --config <path>`). Useful when the config lives in a bind-mounted location inside a container. If omitted, rclone uses its default lookup (~/.config/rclone/rclone.conf or $RCLONE_CONFIG).')
 @click.option('--cache-path', default=None,
               help='Directory used for temporary downloads and hashing. Strongly recommended to point at a fast local SSD when your media lives on a NAS. Defaults to the system temp dir.')
 @click.option('--force', help='Force overwrite of all assets regardless of timestamp or content.', is_flag=True)
 @click.option('--mirror', help='Self-heal mode: download every asset, hash-compare with the local copy, and replace only if the bytes differ. Also re-downloads missing files.', is_flag=True)
+@click.option('--force-hash', help='In mirror mode, hash-verify every existing file regardless of mtime. Useful as a periodic audit or after snapshot rollbacks / rsync restores where mtime may have been preserved. Implies --mirror. Slower (reads every file over NFS).', is_flag=True)
 @click.option('--dry-run', help='Log what would be downloaded without writing any files.', is_flag=True)
 @click.option('--verbose', help='Show extra information?', is_flag=True)
 @click.pass_context
 def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, mirror: bool,
-         verbose: bool, output_path: str, dry_run: bool, cache_path, export_type, rclone_dest):
+         verbose: bool, output_path: str, dry_run: bool, cache_path, export_type, rclone_dest,
+         force_hash: bool, rclone_config):
     export_types = [t.strip().lower() for t in export_type.split(',') if t.strip()]
 
     plex = Plex(baseurl, token, library, force, verbose, output_path, dry_run, mirror,
-                cache_path=cache_path, export_types=export_types, rclone_dest=rclone_dest)
+                cache_path=cache_path, export_types=export_types, rclone_dest=rclone_dest,
+                force_hash=force_hash, rclone_config=rclone_config)
 
     if dry_run:
         print('\033[96mDRY RUN MODE — no files will be written.\033[0m')
@@ -394,12 +451,15 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
         print('\033[94mEXPORT TYPES:\033[0m', ', '.join(export_types))
         if 'rclone' in export_types:
             print('\033[94mRCLONE DEST:\033[0m', rclone_dest)
+            if rclone_config:
+                print('\033[94mRCLONE CONFIG:\033[0m', rclone_config)
         if cache_path:
             print('\033[94mCACHE PATH:\033[0m', cache_path)
         else:
             print('\033[94mCACHE PATH:\033[0m', tempfile.gettempdir(), '(system default)')
         print('\033[94mFORCE OVERWRITE:\033[0m', str(force))
-        print('\033[94mMIRROR MODE:\033[0m', str(mirror))
+        print('\033[94mMIRROR MODE:\033[0m', str(plex.mirror))
+        print('\033[94mFORCE HASH:\033[0m', str(force_hash))
         print('\nGetting library items...')
 
     items = plex.getAll()
