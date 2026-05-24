@@ -39,7 +39,7 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = '0.12'
+VERSION = '0.13'
 
 VALID_EXPORT_TYPES = {'local', 'rclone'}
 
@@ -427,18 +427,25 @@ class Plex():
         # ---- decide what each target needs ----
         local_action = self._decide_local_action(local_path, source_updated_at) if local_path else 'none'
 
-        # Bulk-rclone strategy: we only stage assets that were freshly downloaded for local
-        # reasons. If local says "skip", we trust rclone destination is also current (we
-        # pushed it last time we touched this file). This trades the self-healing-rclone
-        # property for huge bandwidth savings. A periodic --force run can resync rclone
-        # if drift is ever a concern. In rclone-only mode (no local), we have nothing to
-        # gate on, so we always download.
-        if local_path:
-            need_fresh = local_action in ('download', 'mirror')
-        else:
-            need_fresh = rclone_rel is not None
+        needs_local_apply = bool(local_path) and local_action in ('download', 'mirror')
+        needs_rclone = rclone_rel is not None
 
-        if not need_fresh:
+        # Source decision:
+        #   - If local needs fresh bytes (download/mirror), we must download from Plex.
+        #     That cache file then also feeds rclone if rclone is enabled.
+        #   - If local is current but rclone needs the file, use the existing local file
+        #     as the source for rclone (no Plex download — self-heals rclone from local
+        #     without burning Plex bandwidth or re-fetching unchanged content).
+        #   - If only rclone is enabled and no local file exists yet, download from Plex.
+        can_use_local_as_source = (
+            needs_rclone
+            and not needs_local_apply
+            and local_path
+            and os.path.isfile(local_path)
+        )
+        need_plex_download = needs_local_apply or (needs_rclone and not can_use_local_as_source)
+
+        if not needs_local_apply and not needs_rclone:
             if self.verbose:
                 print('\033[93mSKIPPED (Current):\033[0m', local_path or '(no targets)')
             self.skipped += 1
@@ -447,30 +454,37 @@ class Plex():
         # ---- dry run ----
         if self.dry_run:
             actions = []
-            if local_path and local_action in ('download', 'mirror'):
+            if needs_local_apply:
                 actions.append(f'local {local_action} → {local_path}')
-            if rclone_rel:
-                actions.append(f'rclone stage → {rclone_rel}')
+            if needs_rclone:
+                src_label = 'from Plex' if need_plex_download else 'from local'
+                actions.append(f'rclone stage {src_label} → {rclone_rel}')
             print(f'\033[96mDRY RUN:\033[0m {" + ".join(actions) if actions else "(nothing)"}')
             self.downloaded += 1
             return
 
-        # ---- single download, then local apply + rclone stage ----
-        cache_file = self._download_to_cache(url, filename)
-        if not cache_file:
-            self.errors += 1
-            return
+        # ---- acquire source bytes ----
+        cache_file = None
+        if need_plex_download:
+            cache_file = self._download_to_cache(url, filename)
+            if not cache_file:
+                self.errors += 1
+                return
+            source_file = cache_file
+        else:
+            source_file = local_path  # use the on-disk local copy directly
 
         did_work = False
         try:
-            if local_path and local_action in ('download', 'mirror'):
-                if self._apply_local(cache_file, local_path, local_action, source_updated_at):
+            if needs_local_apply:
+                if self._apply_local(source_file, local_path, local_action, source_updated_at):
                     did_work = True
-            if rclone_rel:
-                if self._stage_for_rclone(cache_file, rclone_rel):
+            if needs_rclone:
+                if self._stage_for_rclone(source_file, rclone_rel):
                     did_work = True
         finally:
-            self._safe_remove(cache_file)
+            if cache_file:
+                self._safe_remove(cache_file)
 
         if did_work:
             self.downloaded += 1
