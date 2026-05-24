@@ -39,7 +39,7 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = '0.11'
+VERSION = '0.12'
 
 VALID_EXPORT_TYPES = {'local', 'rclone'}
 
@@ -571,19 +571,37 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
                     season_path = plex.getPath(season)
                     season_updated = getattr(season, 'updatedAt', None)
 
-                    if not season_path:
-                        continue
+                    # season.episodes() is fetched once and reused below for both the
+                    # season-path fallback and the per-episode loop.
+                    episodes = list(season.episodes())
 
-                    if (assets == 'all' or assets == 'posters') and getattr(season, 'thumb', None):
-                        plex.download(season.thumb, 'folder.jpg', season_path, season_updated)
+                    # If plexapi didn't populate season.locations (it's unreliable
+                    # depending on how the section was indexed), derive the season's
+                    # directory from the first episode's media file path.
+                    if not season_path and episodes:
+                        for media in episodes[0].media:
+                            for part in media.parts:
+                                season_path = os.path.dirname(part.file)
+                                break
+                            if season_path:
+                                break
 
-                    if (assets == 'all' or assets == 'backgrounds') and getattr(season, 'art', None):
-                        plex.download(season.art, 'season-fanart.jpg', season_path, season_updated)
+                    # Season-level assets (only if we resolved a path)
+                    if season_path:
+                        if (assets == 'all' or assets == 'posters') and getattr(season, 'thumb', None):
+                            plex.download(season.thumb, 'folder.jpg', season_path, season_updated)
 
-                    if (assets == 'all' or assets == 'banners') and getattr(season, 'banner', None):
-                        plex.download(season.banner, 'season-banner.jpg', season_path, season_updated)
+                        if (assets == 'all' or assets == 'backgrounds') and getattr(season, 'art', None):
+                            plex.download(season.art, 'season-fanart.jpg', season_path, season_updated)
 
-                    for episode in season.episodes():
+                        if (assets == 'all' or assets == 'banners') and getattr(season, 'banner', None):
+                            plex.download(season.banner, 'season-banner.jpg', season_path, season_updated)
+                    elif verbose:
+                        print(f'  [SEASON SKIP] could not resolve path for {item.title} S{getattr(season, "seasonNumber", "?"):02d}')
+
+                    # Episode-level processing is INDEPENDENT of season_path —
+                    # each episode resolves its own directory from its media file.
+                    for episode in episodes:
                         episode_updated = getattr(episode, 'updatedAt', None)
 
                         if (assets == 'all' or assets == 'posters') and getattr(episode, 'thumb', None):
