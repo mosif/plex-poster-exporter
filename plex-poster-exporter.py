@@ -3,6 +3,10 @@
 import os
 import sys
 import datetime
+import hashlib
+import shutil
+import subprocess
+import tempfile
 
 # sys
 sys.dont_write_bytecode = True
@@ -35,22 +39,58 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = 0.5
+VERSION = 0.7
+
+VALID_EXPORT_TYPES = {'local', 'rclone'}
+
 
 # plex
 class Plex():
-    def __init__(self, baseurl=None, token=None, library=None, force=False, verbose=False, output_path=None, dry_run=False):
+    def __init__(self, baseurl=None, token=None, library=None, force=False, verbose=False,
+                 output_path=None, dry_run=False, mirror=False, cache_path=None,
+                 export_types=None, rclone_dest=None):
         self.baseurl = baseurl
         self.token = token
         self.server = None
         self.libraries = []
         self.library = library
         self.force = force
+        self.mirror = mirror
         self.verbose = verbose
         self.output_path = output_path
         self.dry_run = dry_run
+        self.cache_path = cache_path
+        self.export_types = export_types or ['local']
+        self.rclone_dest = rclone_dest
         self.downloaded = 0
         self.skipped = 0
+        self.errors = 0
+
+        # Validate export types
+        invalid = [t for t in self.export_types if t not in VALID_EXPORT_TYPES]
+        if invalid:
+            print(f'\033[91mERROR:\033[0m invalid --export-type value(s): {", ".join(invalid)}. Valid: {", ".join(sorted(VALID_EXPORT_TYPES))}')
+            sys.exit()
+        if not self.export_types:
+            print('\033[91mERROR:\033[0m at least one --export-type is required.')
+            sys.exit()
+
+        # Validate rclone availability if needed
+        if 'rclone' in self.export_types:
+            if not shutil.which('rclone'):
+                print('\033[91mERROR:\033[0m rclone is not installed or not in PATH.')
+                sys.exit()
+            if not self.rclone_dest:
+                print('\033[91mERROR:\033[0m --rclone-dest is required when --export-type includes rclone.')
+                sys.exit()
+
+        # Prepare cache directory if specified
+        if self.cache_path:
+            try:
+                os.makedirs(self.cache_path, exist_ok=True)
+            except Exception as e:
+                print(f'\033[91mERROR:\033[0m could not create cache path {self.cache_path}: {e}')
+                sys.exit()
 
         self.getServer()
         self.getLibrary()
@@ -91,74 +131,233 @@ class Plex():
             if self.library.type == 'movie':
                 return os.path.dirname(loc)
             else:
-                # show or season: locations is already the directory
                 return loc
         return None
 
-    def download(self, url=None, filename=None, path=None, source_updated_at=None):
-        if not url or not path:
-            return
+    def _relative_to_library(self, abs_path):
+        """Strip the matching library root from abs_path to get a library-relative path.
+        Returns None if abs_path isn't under any known library root."""
+        if not hasattr(self.library, 'locations') or not self.library.locations:
+            return None
+        for root in self.library.locations:
+            root_norm = root.rstrip('/')
+            if abs_path == root_norm:
+                return ''
+            if abs_path.startswith(root_norm + '/'):
+                return abs_path[len(root_norm) + 1:]
+        return None
 
-        # Guard against library root paths (less than 2 path segments deep)
-        stripped = path.strip('/')
-        if len(stripped.split('/')) < 2:
-            print(f'\033[91mSKIPPED (Unsafe Path):\033[0m {path} looks like a library root — refusing to write here.')
-            return
+    @staticmethod
+    def _files_equal(a, b):
+        """Compare two files by size first, then SHA-256 if sizes match."""
+        try:
+            if os.path.getsize(a) != os.path.getsize(b):
+                return False
+            ha, hb = hashlib.sha256(), hashlib.sha256()
+            with open(a, 'rb') as fa, open(b, 'rb') as fb:
+                while True:
+                    ca = fa.read(65536)
+                    cb = fb.read(65536)
+                    if not ca and not cb:
+                        break
+                    ha.update(ca)
+                    hb.update(cb)
+            return ha.hexdigest() == hb.hexdigest()
+        except Exception:
+            return False
 
-        if self.output_path == '/':
-            abs_path = path
-        else:
-            path = path.lstrip('/')
-            abs_path = os.path.join(self.output_path, path)
+    @staticmethod
+    def _safe_remove(path):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
 
-        final_file_path = os.path.join(abs_path, filename)
-        should_download = True
-
-        # SMART SYNC LOGIC
-        if os.path.isfile(final_file_path):
-            if self.force:
-                should_download = True
-            elif source_updated_at:
-                local_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(final_file_path))
-                # 1 minute buffer for clock drift
-                if source_updated_at > (local_mtime + datetime.timedelta(seconds=60)):
-                    should_download = True
-                    if self.verbose:
-                        print(f'  [UPDATE DETECTED] Plex: {source_updated_at} > Local: {local_mtime}')
-                else:
-                    should_download = False
-            else:
-                should_download = False
-
-        if not should_download:
+    def _decide_local_action(self, local_path, source_updated_at):
+        """Returns 'download' (missing/force/timestamp-newer), 'mirror' (mirror mode), or 'skip'."""
+        if not os.path.isfile(local_path):
             if self.verbose:
-                print('\033[93mSKIPPED (Current):\033[0m', final_file_path)
-            self.skipped += 1
-            return
+                print(f'  [MISSING] {local_path}')
+            return 'download'
+        if self.force:
+            return 'download'
+        if self.mirror:
+            return 'mirror'
+        if source_updated_at:
+            local_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(local_path))
+            if source_updated_at > (local_mtime + datetime.timedelta(seconds=60)):
+                if self.verbose:
+                    print(f'  [UPDATE DETECTED] Plex: {source_updated_at} > Local: {local_mtime}')
+                return 'download'
+        return 'skip'
 
-        if self.dry_run:
-            print(f'\033[96mDRY RUN:\033[0m Would download → {final_file_path}')
-            self.downloaded += 1
-            return
+    def _download_to_cache(self, url, filename):
+        """Download from Plex into the cache directory. Returns the cache file path or None."""
+        cache_dir = self.cache_path or tempfile.gettempdir()
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
 
-        if not os.path.exists(abs_path):
-            try:
-                os.makedirs(abs_path)
-            except Exception:
-                pass
+        # Unique temp path so parallel runs/crashes don't collide
+        fd, cache_file = tempfile.mkstemp(prefix='plex-', suffix='-' + filename, dir=cache_dir)
+        os.close(fd)
+        cache_basename = os.path.basename(cache_file)
+        cache_dirname = os.path.dirname(cache_file)
 
         try:
             full_url = self.server._baseurl + url
-            if plexapi.utils.download(full_url, self.token, filename=filename, savepath=abs_path):
-                if self.verbose:
-                    print('\033[92mDOWNLOADED:\033[0m', final_file_path)
-                self.downloaded += 1
-            else:
-                print('\033[91mDOWNLOAD FAILED (Generic):\033[0m', final_file_path)
+            result = plexapi.utils.download(full_url, self.token, filename=cache_basename, savepath=cache_dirname)
+            if not result:
+                self._safe_remove(cache_file)
+                return None
+            return cache_file
         except NotFound:
             print(f'\033[91mNOT FOUND (404):\033[0m Plex cannot find the asset file for {filename}.')
+            self._safe_remove(cache_file)
+            return None
         except Exception as e:
-            print(f'\033[91mERROR:\033[0m {e}')
+            print(f'\033[91mDOWNLOAD ERROR ({filename}):\033[0m {e}')
+            self._safe_remove(cache_file)
+            return None
+
+    def _apply_local(self, cache_file, local_path, action):
+        """Place cache_file at local_path according to action. Returns True if a write occurred."""
+        local_dir = os.path.dirname(local_path)
+        file_existed = os.path.isfile(local_path)
+
+        if not os.path.exists(local_dir):
+            try:
+                os.makedirs(local_dir)
+            except Exception as e:
+                print(f'\033[91mLOCAL MKDIR ERROR:\033[0m {e}')
+                return False
+
+        if action == 'mirror' and file_existed:
+            if self._files_equal(cache_file, local_path):
+                if self.verbose:
+                    print('\033[93mLOCAL SKIPPED (Matches):\033[0m', local_path)
+                return False
+
+        try:
+            # copy2 works across filesystems (cache on SSD → target on NAS) and preserves mtime
+            shutil.copy2(cache_file, local_path)
+            if self.verbose:
+                if action == 'mirror' and file_existed:
+                    label = 'LOCAL REPLACED (Differs)'
+                elif file_existed:
+                    label = 'LOCAL OVERWRITTEN'
+                else:
+                    label = 'LOCAL CREATED'
+                print(f'\033[92m{label}:\033[0m', local_path)
+            return True
+        except Exception as e:
+            print(f'\033[91mLOCAL WRITE ERROR:\033[0m {e}')
+            return False
+
+    def _apply_rclone(self, cache_file, rclone_path):
+        """Upload cache_file to rclone_path using `rclone copyto`. Returns True on success."""
+        cmd = ['rclone', 'copyto']
+        if not self.force:
+            # --checksum makes rclone compare hashes (Google Drive stores MD5) and skip if equal
+            cmd.append('--checksum')
+        cmd.extend([cache_file, rclone_path])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0:
+                if self.verbose:
+                    print('\033[92mRCLONE SYNCED:\033[0m', rclone_path)
+                return True
+            print(f'\033[91mRCLONE FAILED:\033[0m {rclone_path}')
+            err = (result.stderr or '').strip()
+            if err:
+                print(f'  {err}')
+            return False
+        except subprocess.TimeoutExpired:
+            print(f'\033[91mRCLONE TIMEOUT:\033[0m {rclone_path}')
+            return False
+        except Exception as e:
+            print(f'\033[91mRCLONE ERROR:\033[0m {e}')
+            return False
+
+    def download(self, url=None, filename=None, abs_dir=None, source_updated_at=None):
+        if not url or not abs_dir:
+            return
+
+        # Guard against library root paths (less than 2 path segments deep)
+        stripped = abs_dir.strip('/')
+        if len(stripped.split('/')) < 2:
+            print(f'\033[91mSKIPPED (Unsafe Path):\033[0m {abs_dir} looks like a library root — refusing to write here.')
+            return
+
+        # ---- compute target paths ----
+        local_path = None
+        if 'local' in self.export_types:
+            if self.output_path == '/':
+                local_dir = abs_dir
+            else:
+                local_dir = os.path.join(self.output_path, abs_dir.lstrip('/'))
+            local_path = os.path.join(local_dir, filename)
+
+        rclone_path = None
+        if 'rclone' in self.export_types:
+            rel = self._relative_to_library(abs_dir)
+            if rel is None:
+                print(f'\033[91mRCLONE WARN:\033[0m {abs_dir} is not under any library root; skipping rclone for this asset.')
+            else:
+                base = self.rclone_dest.rstrip('/')
+                if rel:
+                    rclone_path = base + '/' + rel.strip('/') + '/' + filename
+                else:
+                    rclone_path = base + '/' + filename
+
+        # ---- decide what each target needs ----
+        local_action = self._decide_local_action(local_path, source_updated_at) if local_path else 'none'
+        # rclone always runs when configured; `rclone copyto --checksum` handles skip-if-same itself
+        rclone_will_run = rclone_path is not None
+
+        need_fresh = (local_action in ('download', 'mirror')) or rclone_will_run
+
+        if not need_fresh:
+            if self.verbose:
+                print('\033[93mSKIPPED (Current):\033[0m', local_path or '(no targets)')
+            self.skipped += 1
+            return
+
+        # ---- dry run ----
+        if self.dry_run:
+            actions = []
+            if local_path and local_action in ('download', 'mirror'):
+                actions.append(f'local {local_action} → {local_path}')
+            if rclone_will_run:
+                actions.append(f'rclone copyto → {rclone_path}')
+            print(f'\033[96mDRY RUN:\033[0m {" + ".join(actions) if actions else "(nothing)"}')
+            self.downloaded += 1
+            return
+
+        # ---- single download, multiple writes ----
+        cache_file = self._download_to_cache(url, filename)
+        if not cache_file:
+            self.errors += 1
+            return
+
+        did_work = False
+        try:
+            if local_path and local_action in ('download', 'mirror'):
+                if self._apply_local(cache_file, local_path, local_action):
+                    did_work = True
+            if rclone_path:
+                if self._apply_rclone(cache_file, rclone_path):
+                    did_work = True
+        finally:
+            self._safe_remove(cache_file)
+
+        if did_work:
+            self.downloaded += 1
+        else:
+            self.skipped += 1
 
 
 # main
@@ -168,20 +367,39 @@ class Plex():
 @click.option('--token', prompt='Plex Token', help='The authentication token for Plex.', required=True)
 @click.option('--library', help='The Plex library name.')
 @click.option('--assets', help='Which assets should be exported?', type=click.Choice(['all', 'posters', 'backgrounds', 'banners', 'themes']), default='all')
-@click.option('--output-path', default='/', help='The output path for the downloaded assets.')
-@click.option('--force', help='Force overwrite of all assets regardless of timestamp?', is_flag=True)
+@click.option('--output-path', default='/', help='The local output path root for downloaded assets.')
+@click.option('--export-type', default='local',
+              help='Comma-separated targets: local, rclone, or local,rclone. Default: local.')
+@click.option('--rclone-dest', default=None,
+              help='rclone destination prefix (e.g., gdrive:JellyfinPosters/TV). The library-relative path is appended. Required when --export-type includes rclone.')
+@click.option('--cache-path', default=None,
+              help='Directory used for temporary downloads and hashing. Strongly recommended to point at a fast local SSD when your media lives on a NAS. Defaults to the system temp dir.')
+@click.option('--force', help='Force overwrite of all assets regardless of timestamp or content.', is_flag=True)
+@click.option('--mirror', help='Self-heal mode: download every asset, hash-compare with the local copy, and replace only if the bytes differ. Also re-downloads missing files.', is_flag=True)
 @click.option('--dry-run', help='Log what would be downloaded without writing any files.', is_flag=True)
 @click.option('--verbose', help='Show extra information?', is_flag=True)
 @click.pass_context
-def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, verbose: bool, output_path: str, dry_run: bool):
-    plex = Plex(baseurl, token, library, force, verbose, output_path, dry_run)
+def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, mirror: bool,
+         verbose: bool, output_path: str, dry_run: bool, cache_path, export_type, rclone_dest):
+    export_types = [t.strip().lower() for t in export_type.split(',') if t.strip()]
+
+    plex = Plex(baseurl, token, library, force, verbose, output_path, dry_run, mirror,
+                cache_path=cache_path, export_types=export_types, rclone_dest=rclone_dest)
 
     if dry_run:
         print('\033[96mDRY RUN MODE — no files will be written.\033[0m')
 
     if verbose:
         print('\033[94mASSETS:\033[0m', assets)
+        print('\033[94mEXPORT TYPES:\033[0m', ', '.join(export_types))
+        if 'rclone' in export_types:
+            print('\033[94mRCLONE DEST:\033[0m', rclone_dest)
+        if cache_path:
+            print('\033[94mCACHE PATH:\033[0m', cache_path)
+        else:
+            print('\033[94mCACHE PATH:\033[0m', tempfile.gettempdir(), '(system default)')
         print('\033[94mFORCE OVERWRITE:\033[0m', str(force))
+        print('\033[94mMIRROR MODE:\033[0m', str(mirror))
         print('\nGetting library items...')
 
     items = plex.getAll()
@@ -206,7 +424,6 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
                     print(f'  [SKIP] No path found for {item.title}')
                 continue
 
-            # Use None as fallback so timestamp logic doesn't fire on stale data
             item_updated = getattr(item, 'updatedAt', None)
 
             # MOVIE / SHOW LEVEL ASSETS
@@ -225,9 +442,7 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
             # TV SPECIFIC
             if plex.library.type == 'show':
                 for season in item.seasons():
-                    # Use item.locations-based path for the season
                     season_path = plex.getPath(season)
-                    # Fallback: None so timestamp logic doesn't fire incorrectly
                     season_updated = getattr(season, 'updatedAt', None)
 
                     if not season_path:
@@ -246,7 +461,6 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
                         episode_updated = getattr(episode, 'updatedAt', None)
 
                         if (assets == 'all' or assets == 'posters') and getattr(episode, 'thumb', None):
-                            # Find the episode file path — break cleanly out of both loops
                             ep_path = None
                             ep_filename = None
                             for media in episode.media:
@@ -265,10 +479,12 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
     print()
     if dry_run:
         print('\033[96mDRY RUN COMPLETE\033[0m')
-        print('\033[94mWOULD DOWNLOAD:\033[0m', str(plex.downloaded))
+        print('\033[94mWOULD PROCESS:\033[0m', str(plex.downloaded))
     else:
         print('\033[94mTOTAL SKIPPED:\033[0m', str(plex.skipped))
-        print('\033[94mTOTAL DOWNLOADED:\033[0m', str(plex.downloaded))
+        print('\033[94mTOTAL PROCESSED:\033[0m', str(plex.downloaded))
+        if plex.errors:
+            print('\033[91mTOTAL ERRORS:\033[0m', str(plex.errors))
 
 
 # run
