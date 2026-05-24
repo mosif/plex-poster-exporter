@@ -39,7 +39,7 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = '0.10'
+VERSION = '0.11'
 
 VALID_EXPORT_TYPES = {'local', 'rclone'}
 
@@ -65,6 +65,8 @@ class Plex():
         self.export_types = export_types or ['local']
         self.rclone_dest = rclone_dest
         self.rclone_config = rclone_config
+        self.rclone_staging = None
+        self.rclone_staged = 0
         self.downloaded = 0
         self.skipped = 0
         self.errors = 0
@@ -93,6 +95,22 @@ class Plex():
                 os.makedirs(self.cache_path, exist_ok=True)
             except Exception as e:
                 print(f'\033[91mERROR:\033[0m could not create cache path {self.cache_path}: {e}')
+                sys.exit()
+
+        # Prepare a structured staging dir for the end-of-run bulk rclone copy.
+        # Per-file rclone copyto causes duplicate folders on Google Drive due to
+        # the API's eventual consistency; one bulk `rclone copy` at the end avoids
+        # the race entirely AND is dramatically faster.
+        if 'rclone' in self.export_types:
+            staging_base = self.cache_path or tempfile.gettempdir()
+            self.rclone_staging = os.path.join(staging_base, 'plex-poster-rclone-staging')
+            # Wipe any leftover from a previous (possibly failed) run
+            if os.path.exists(self.rclone_staging):
+                shutil.rmtree(self.rclone_staging, ignore_errors=True)
+            try:
+                os.makedirs(self.rclone_staging, exist_ok=True)
+            except Exception as e:
+                print(f'\033[91mERROR:\033[0m could not create rclone staging dir {self.rclone_staging}: {e}')
                 sys.exit()
 
         self.getServer()
@@ -305,34 +323,76 @@ class Plex():
         except Exception:
             pass
 
-    def _apply_rclone(self, cache_file, rclone_path):
-        """Upload cache_file to rclone_path using `rclone copyto`. Returns True on success."""
-        cmd = ['rclone']
-        if self.rclone_config:
-            cmd.extend(['--config', self.rclone_config])
-        cmd.append('copyto')
-        if not self.force:
-            # --checksum makes rclone compare hashes (Google Drive stores MD5) and skip if equal
-            cmd.append('--checksum')
-        cmd.extend([cache_file, rclone_path])
+    def _stage_for_rclone(self, cache_file, rel_path):
+        """Copy cache_file into the staging tree at rel_path (rel_path includes filename).
+        At end of run, finalize_rclone() will bulk-copy the entire staging tree."""
+        if not self.rclone_staging or not rel_path:
+            return False
+        target = os.path.join(self.rclone_staging, rel_path)
+        target_dir = os.path.dirname(target)
+        try:
+            if target_dir:
+                os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(cache_file, target)
+            self.rclone_staged += 1
+            if self.verbose:
+                print('\033[92mRCLONE STAGED:\033[0m', rel_path)
+            return True
+        except Exception as e:
+            print(f'\033[91mRCLONE STAGE ERROR:\033[0m {e}')
+            return False
+
+    def finalize_rclone(self):
+        """One bulk `rclone copy --checksum` of the entire staging tree to the destination.
+        Called once at end of main(). Resolves destination directories once (no race),
+        skips files whose checksums match (Google Drive stores MD5)."""
+        if not self.rclone_staging:
+            return
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode == 0:
+            if self.rclone_staged == 0:
                 if self.verbose:
-                    print('\033[92mRCLONE SYNCED:\033[0m', rclone_path)
-                return True
-            print(f'\033[91mRCLONE FAILED:\033[0m {rclone_path}')
-            err = (result.stderr or '').strip()
-            if err:
-                print(f'  {err}')
-            return False
-        except subprocess.TimeoutExpired:
-            print(f'\033[91mRCLONE TIMEOUT:\033[0m {rclone_path}')
-            return False
-        except Exception as e:
-            print(f'\033[91mRCLONE ERROR:\033[0m {e}')
-            return False
+                    print('\033[93mRCLONE FINAL:\033[0m nothing staged this run, skipping bulk copy.')
+                return
+
+            if self.dry_run:
+                print(f'\033[96mDRY RUN:\033[0m Would bulk-copy {self.rclone_staged} staged file(s) → {self.rclone_dest}')
+                return
+
+            cmd = ['rclone']
+            if self.rclone_config:
+                cmd.extend(['--config', self.rclone_config])
+            cmd.append('copy')
+            if not self.force:
+                cmd.append('--checksum')
+            # Trailing slash on src means "contents of"
+            src = self.rclone_staging.rstrip('/') + '/'
+            cmd.extend([src, self.rclone_dest])
+
+            if self.verbose:
+                print(f'\033[94mRCLONE FINAL:\033[0m bulk-copying {self.rclone_staged} file(s) → {self.rclone_dest}')
+
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f'\033[92mRCLONE BULK SYNCED:\033[0m {self.rclone_staged} file(s) → {self.rclone_dest}')
+                    if self.verbose and result.stdout.strip():
+                        print(result.stdout.strip())
+                else:
+                    print('\033[91mRCLONE BULK SYNC FAILED:\033[0m')
+                    err = (result.stderr or '').strip()
+                    if err:
+                        print(err)
+                    self.errors += 1
+            except Exception as e:
+                print(f'\033[91mRCLONE BULK SYNC ERROR:\033[0m {e}')
+                self.errors += 1
+        finally:
+            # Always clean up staging, success or failure. Next run starts fresh.
+            try:
+                shutil.rmtree(self.rclone_staging, ignore_errors=True)
+            except Exception:
+                pass
 
     def download(self, url=None, filename=None, abs_dir=None, source_updated_at=None):
         if not url or not abs_dir:
@@ -353,24 +413,30 @@ class Plex():
                 local_dir = os.path.join(self.output_path, abs_dir.lstrip('/'))
             local_path = os.path.join(local_dir, filename)
 
-        rclone_path = None
+        rclone_rel = None  # staging-relative path including filename
         if 'rclone' in self.export_types:
-            rel = self._relative_to_library(abs_dir)
-            if rel is None:
+            rel_dir = self._relative_to_library(abs_dir)
+            if rel_dir is None:
                 print(f'\033[91mRCLONE WARN:\033[0m {abs_dir} is not under any library root; skipping rclone for this asset.')
             else:
-                base = self.rclone_dest.rstrip('/')
-                if rel:
-                    rclone_path = base + '/' + rel.strip('/') + '/' + filename
+                if rel_dir:
+                    rclone_rel = rel_dir.strip('/') + '/' + filename
                 else:
-                    rclone_path = base + '/' + filename
+                    rclone_rel = filename
 
         # ---- decide what each target needs ----
         local_action = self._decide_local_action(local_path, source_updated_at) if local_path else 'none'
-        # rclone always runs when configured; `rclone copyto --checksum` handles skip-if-same itself
-        rclone_will_run = rclone_path is not None
 
-        need_fresh = (local_action in ('download', 'mirror')) or rclone_will_run
+        # Bulk-rclone strategy: we only stage assets that were freshly downloaded for local
+        # reasons. If local says "skip", we trust rclone destination is also current (we
+        # pushed it last time we touched this file). This trades the self-healing-rclone
+        # property for huge bandwidth savings. A periodic --force run can resync rclone
+        # if drift is ever a concern. In rclone-only mode (no local), we have nothing to
+        # gate on, so we always download.
+        if local_path:
+            need_fresh = local_action in ('download', 'mirror')
+        else:
+            need_fresh = rclone_rel is not None
 
         if not need_fresh:
             if self.verbose:
@@ -383,13 +449,13 @@ class Plex():
             actions = []
             if local_path and local_action in ('download', 'mirror'):
                 actions.append(f'local {local_action} → {local_path}')
-            if rclone_will_run:
-                actions.append(f'rclone copyto → {rclone_path}')
+            if rclone_rel:
+                actions.append(f'rclone stage → {rclone_rel}')
             print(f'\033[96mDRY RUN:\033[0m {" + ".join(actions) if actions else "(nothing)"}')
             self.downloaded += 1
             return
 
-        # ---- single download, multiple writes ----
+        # ---- single download, then local apply + rclone stage ----
         cache_file = self._download_to_cache(url, filename)
         if not cache_file:
             self.errors += 1
@@ -400,8 +466,8 @@ class Plex():
             if local_path and local_action in ('download', 'mirror'):
                 if self._apply_local(cache_file, local_path, local_action, source_updated_at):
                     did_work = True
-            if rclone_path:
-                if self._apply_rclone(cache_file, rclone_path):
+            if rclone_rel:
+                if self._stage_for_rclone(cache_file, rclone_rel):
                     did_work = True
         finally:
             self._safe_remove(cache_file)
@@ -536,6 +602,10 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
         except Exception as e:
             print(f'\033[91mERROR Processing {item.title}:\033[0m {e}')
 
+    # End of per-asset loop — do the single bulk rclone copy now (no-op if nothing staged)
+    print()
+    plex.finalize_rclone()
+
     print()
     if dry_run:
         print('\033[96mDRY RUN COMPLETE\033[0m')
@@ -543,6 +613,8 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
     else:
         print('\033[94mTOTAL SKIPPED:\033[0m', str(plex.skipped))
         print('\033[94mTOTAL PROCESSED:\033[0m', str(plex.downloaded))
+        if plex.rclone_staging is not None:
+            print('\033[94mRCLONE STAGED:\033[0m', str(plex.rclone_staged))
         if plex.errors:
             print('\033[91mTOTAL ERRORS:\033[0m', str(plex.errors))
 
