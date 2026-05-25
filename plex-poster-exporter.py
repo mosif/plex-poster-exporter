@@ -50,7 +50,7 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = '0.19'
+VERSION = '0.20'
 
 VALID_EXPORT_TYPES = {'local', 'rclone'}
 
@@ -641,6 +641,7 @@ class Plex():
             self.errors += 1
 
 
+    def download(self, url=None, rel_path=None, source_updated_at=None):
         """Download a Plex asset and route it to all configured destinations.
 
         `rel_path` is the Local Posters-style relative path including filename, e.g.
