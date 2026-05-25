@@ -8,6 +8,14 @@ import shutil
 import subprocess
 import tempfile
 
+# pwd/grp are POSIX-only; we use them for --owner name resolution
+try:
+    import pwd
+    import grp
+    _HAVE_USER_LOOKUP = True
+except ImportError:
+    _HAVE_USER_LOOKUP = False
+
 # sys
 sys.dont_write_bytecode = True
 if sys.version_info[0] < 3:
@@ -39,7 +47,7 @@ except ImportError:
 
 # defaults
 NAME = 'plex-poster-exporter'
-VERSION = '0.13'
+VERSION = '0.18'
 
 VALID_EXPORT_TYPES = {'local', 'rclone'}
 
@@ -48,7 +56,8 @@ VALID_EXPORT_TYPES = {'local', 'rclone'}
 class Plex():
     def __init__(self, baseurl=None, token=None, library=None, force=False, verbose=False,
                  output_path=None, dry_run=False, mirror=False, cache_path=None,
-                 export_types=None, rclone_dest=None, force_hash=False, rclone_config=None):
+                 export_types=None, rclone_dest=None, force_hash=False, rclone_config=None,
+                 owner=None):
         self.baseurl = baseurl
         self.token = token
         self.server = None
@@ -67,6 +76,11 @@ class Plex():
         self.rclone_config = rclone_config
         self.rclone_staging = None
         self.rclone_staged = 0
+        self.owner_uid = None
+        self.owner_gid = None
+        if owner:
+            self._parse_owner(owner)
+        self.unmatched_year = []  # titles without year metadata — won't match LP Primary regexes
         self.downloaded = 0
         self.skipped = 0
         self.errors = 0
@@ -115,6 +129,62 @@ class Plex():
 
         self.getServer()
         self.getLibrary()
+
+    def _parse_owner(self, spec):
+        """Parse '--owner' spec into self.owner_uid / self.owner_gid.
+        Accepted forms: 'uid', 'uid:gid', 'user', 'user:group', 'user:gid', 'uid:group'.
+        If group is omitted, the user's primary group is used (when name resolution works);
+        otherwise the gid defaults to the uid value."""
+        parts = spec.split(':', 1)
+        user_part = parts[0].strip()
+        group_part = parts[1].strip() if len(parts) > 1 else None
+
+        def resolve_user(token):
+            try:
+                return int(token)
+            except ValueError:
+                if not _HAVE_USER_LOOKUP:
+                    print(f'\033[91mERROR:\033[0m --owner needs numeric uid on this platform (no pwd module).')
+                    sys.exit()
+                try:
+                    return pwd.getpwnam(token).pw_uid
+                except KeyError:
+                    print(f'\033[91mERROR:\033[0m unknown user "{token}" in --owner.')
+                    sys.exit()
+
+        def resolve_group(token):
+            try:
+                return int(token)
+            except ValueError:
+                if not _HAVE_USER_LOOKUP:
+                    print(f'\033[91mERROR:\033[0m --owner needs numeric gid on this platform (no grp module).')
+                    sys.exit()
+                try:
+                    return grp.getgrnam(token).gr_gid
+                except KeyError:
+                    print(f'\033[91mERROR:\033[0m unknown group "{token}" in --owner.')
+                    sys.exit()
+
+        self.owner_uid = resolve_user(user_part)
+        if group_part is not None:
+            self.owner_gid = resolve_group(group_part)
+        elif _HAVE_USER_LOOKUP:
+            try:
+                self.owner_gid = pwd.getpwuid(self.owner_uid).pw_gid
+            except KeyError:
+                self.owner_gid = self.owner_uid
+        else:
+            self.owner_gid = self.owner_uid
+
+    def _apply_owner(self, path):
+        """chown path to the configured --owner, silently no-op if --owner wasn't set."""
+        if self.owner_uid is None:
+            return
+        try:
+            os.chown(path, self.owner_uid, self.owner_gid)
+        except Exception as e:
+            if self.verbose:
+                print(f'  [CHOWN WARN] {path}: {e}')
 
     def getServer(self):
         try:
@@ -167,6 +237,76 @@ class Plex():
             if abs_path.startswith(root_norm + '/'):
                 return abs_path[len(root_norm) + 1:]
         return None
+
+    # ----- Local Posters filename builders -----
+    # The Jellyfin Local Posters plugin (NooNameR/Jellyfin.Plugin.LocalPosters) uses
+    # MediUX/TPDb naming. We generate filenames that match its regexes so the bulk
+    # rclone-uploaded tree is directly consumable by the plugin's GDrive sync.
+    #
+    # Key constraints (from the plugin's C# matchers):
+    #   - Brackets [] in filenames break the regex. Only {tag} braces tolerated.
+    #   - Series, Season, and Movie Primary REQUIRE a 4-digit year.
+    #   - Season and Episode item types only support Primary image (no per-season art).
+    #   - Art types (Backdrop/Banner/Logo/Disc/Thumb/Art) follow: "Title (Year) - <Type>.ext".
+
+    _LP_FILENAME_STRIP = '[]{}<>:"/\\|?*'
+
+    @classmethod
+    def _lp_clean(cls, title):
+        if not title:
+            return ''
+        out = ''.join(' ' if c in cls._LP_FILENAME_STRIP else c for c in title)
+        return ' '.join(out.split())  # collapse whitespace
+
+    @classmethod
+    def _lp_show_folder(cls, show_title, year):
+        """Subfolder name under the rclone destination for one show's assets."""
+        t = cls._lp_clean(show_title)
+        return f'{t} ({year})' if year else t
+
+    @classmethod
+    def _lp_series_filename(cls, show_title, year, ext='jpg', art_type=None):
+        """Primary (art_type=None) or Art (Backdrop/Banner/etc) for a Series."""
+        t = cls._lp_clean(show_title)
+        base = f'{t} ({year})' if year else t
+        return f'{base} - {art_type}.{ext}' if art_type else f'{base}.{ext}'
+
+    @classmethod
+    def _lp_season_filename(cls, show_title, year, season_index, season_name=None, ext='jpg'):
+        """Season Primary. Uses 'Season NN' for numbered seasons, season name for specials/named."""
+        t = cls._lp_clean(show_title)
+        if season_index and season_index > 0:
+            tail = f'Season {season_index:02d}'
+        else:
+            tail = cls._lp_clean(season_name) or 'Specials'
+        return f'{t} ({year}) - {tail}.{ext}'
+
+    @classmethod
+    def _lp_episode_filename(cls, show_title, year, season_index, episode_index, ext='jpg'):
+        """Episode Primary."""
+        t = cls._lp_clean(show_title)
+        base = f'{t} ({year})' if year else t
+        return f'{base} - S{season_index:02d}E{episode_index:02d}.{ext}'
+
+    @classmethod
+    def _lp_movie_filename(cls, movie_title, year, ext='jpg', art_type=None):
+        """Primary (art_type=None) or Art for a Movie."""
+        t = cls._lp_clean(movie_title)
+        base = f'{t} ({year})' if year else t
+        return f'{base} - {art_type}.{ext}' if art_type else f'{base}.{ext}'
+
+    @classmethod
+    def _lp_collection_filename(cls, collection_title, ext='jpg', art_type=None):
+        """BoxSet Primary or Art. The plugin's MovieCollection regex requires the
+        filename (minus art-type suffix) to end with the literal word 'Collection'.
+        If the Plex collection title already ends in 'Collection' we don't double it up."""
+        t = cls._lp_clean(collection_title).rstrip()
+        if not t.lower().endswith(' collection') and not t.lower().endswith('collection'):
+            t = f'{t} Collection'
+        elif not t.lower().endswith(' collection'):
+            # Title was "...Collection" with no preceding space — normalize to "... Collection"
+            t = t[:-len('Collection')].rstrip() + ' Collection'
+        return f'{t} - {art_type}.{ext}' if art_type else f'{t}.{ext}'
 
     @staticmethod
     def _files_equal(a, b):
@@ -281,6 +421,7 @@ class Plex():
         if not os.path.exists(local_dir):
             try:
                 os.makedirs(local_dir)
+                self._apply_owner(local_dir)
             except Exception as e:
                 print(f'\033[91mLOCAL MKDIR ERROR:\033[0m {e}')
                 return False
@@ -297,6 +438,15 @@ class Plex():
         try:
             # copy2 works across filesystems (cache on SSD → target on NAS) and preserves mtime
             shutil.copy2(cache_file, local_path)
+            # Cache file inherits 0600 from tempfile.mkstemp and copy2 preserves it, so
+            # without this chmod every asset is unreadable to any user other than the
+            # one running the script. Media servers (Jellyfin, Plex, etc.) typically run
+            # as their own user, not root.
+            try:
+                os.chmod(local_path, 0o644)
+            except Exception:
+                pass
+            self._apply_owner(local_path)
             # Align local mtime with Plex's updatedAt so future runs can cheaply detect
             # external modification (local mtime > Plex updatedAt == something touched it).
             self._align_mtime(local_path, source_updated_at)
@@ -394,35 +544,42 @@ class Plex():
             except Exception:
                 pass
 
-    def download(self, url=None, filename=None, abs_dir=None, source_updated_at=None):
-        if not url or not abs_dir:
+    def download(self, url=None, filename=None, abs_dir=None, source_updated_at=None,
+                 rclone_rel=None):
+        """Download a Plex asset.
+        - `filename` + `abs_dir` define the LOCAL (media-folder convention) target.
+          Either can be None to skip the local export (e.g. for Plex collections that
+          have no on-disk media folder).
+        - `rclone_rel` is the staging-relative path (Local Posters convention) for the
+          rclone destination, e.g. 'Gold Rush (2010)/Gold Rush (2010) - S16E01.jpg'.
+          Pass None to skip rclone for this asset (e.g. theme.mp3).
+        """
+        if not url:
             return
 
-        # Guard against library root paths (less than 2 path segments deep)
-        stripped = abs_dir.strip('/')
-        if len(stripped.split('/')) < 2:
-            print(f'\033[91mSKIPPED (Unsafe Path):\033[0m {abs_dir} looks like a library root — refusing to write here.')
-            return
+        # rclone target (computed first since it doesn't depend on abs_dir)
+        if 'rclone' not in self.export_types:
+            rclone_rel = None
+        elif rclone_rel:
+            rclone_rel = rclone_rel.lstrip('/')
 
-        # ---- compute target paths ----
+        # local target requires both abs_dir AND filename
         local_path = None
-        if 'local' in self.export_types:
-            if self.output_path == '/':
-                local_dir = abs_dir
+        if 'local' in self.export_types and abs_dir and filename:
+            stripped = abs_dir.strip('/')
+            if len(stripped.split('/')) < 2:
+                print(f'\033[91mSKIPPED (Unsafe Path):\033[0m {abs_dir} looks like a library root — refusing to write here.')
+                # Continue: rclone may still be valid for this asset
             else:
-                local_dir = os.path.join(self.output_path, abs_dir.lstrip('/'))
-            local_path = os.path.join(local_dir, filename)
-
-        rclone_rel = None  # staging-relative path including filename
-        if 'rclone' in self.export_types:
-            rel_dir = self._relative_to_library(abs_dir)
-            if rel_dir is None:
-                print(f'\033[91mRCLONE WARN:\033[0m {abs_dir} is not under any library root; skipping rclone for this asset.')
-            else:
-                if rel_dir:
-                    rclone_rel = rel_dir.strip('/') + '/' + filename
+                if self.output_path == '/':
+                    local_dir = abs_dir
                 else:
-                    rclone_rel = filename
+                    local_dir = os.path.join(self.output_path, abs_dir.lstrip('/'))
+                local_path = os.path.join(local_dir, filename)
+
+        # Nothing to do at all?
+        if not local_path and not rclone_rel:
+            return
 
         # ---- decide what each target needs ----
         local_action = self._decide_local_action(local_path, source_updated_at) if local_path else 'none'
@@ -466,7 +623,9 @@ class Plex():
         # ---- acquire source bytes ----
         cache_file = None
         if need_plex_download:
-            cache_file = self._download_to_cache(url, filename)
+            # filename can be None for collections; derive a suffix from rclone_rel
+            cache_label = filename or (os.path.basename(rclone_rel) if rclone_rel else 'download')
+            cache_file = self._download_to_cache(url, cache_label)
             if not cache_file:
                 self.errors += 1
                 return
@@ -508,6 +667,8 @@ class Plex():
               help='Path to a custom rclone config file (passed as `rclone --config <path>`). Useful when the config lives in a bind-mounted location inside a container. If omitted, rclone uses its default lookup (~/.config/rclone/rclone.conf or $RCLONE_CONFIG).')
 @click.option('--cache-path', default=None,
               help='Directory used for temporary downloads and hashing. Strongly recommended to point at a fast local SSD when your media lives on a NAS. Defaults to the system temp dir.')
+@click.option('--owner', default=None,
+              help='Optional uid:gid (or user:group, or just user/uid) to chown created files and directories to. Useful when the script runs as root inside a container but your media server runs as a different user (e.g. "downloader:downloaders" or "1000:1000"). Numeric IDs are always accepted; names require the user/group to exist inside the script\'s container.')
 @click.option('--force', help='Force overwrite of all assets regardless of timestamp or content.', is_flag=True)
 @click.option('--mirror', help='Self-heal mode: download every asset, hash-compare with the local copy, and replace only if the bytes differ. Also re-downloads missing files.', is_flag=True)
 @click.option('--force-hash', help='In mirror mode, hash-verify every existing file regardless of mtime. Useful as a periodic audit or after snapshot rollbacks / rsync restores where mtime may have been preserved. Implies --mirror. Slower (reads every file over NFS).', is_flag=True)
@@ -516,12 +677,12 @@ class Plex():
 @click.pass_context
 def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, mirror: bool,
          verbose: bool, output_path: str, dry_run: bool, cache_path, export_type, rclone_dest,
-         force_hash: bool, rclone_config):
+         force_hash: bool, rclone_config, owner):
     export_types = [t.strip().lower() for t in export_type.split(',') if t.strip()]
 
     plex = Plex(baseurl, token, library, force, verbose, output_path, dry_run, mirror,
                 cache_path=cache_path, export_types=export_types, rclone_dest=rclone_dest,
-                force_hash=force_hash, rclone_config=rclone_config)
+                force_hash=force_hash, rclone_config=rclone_config, owner=owner)
 
     if dry_run:
         print('\033[96mDRY RUN MODE — no files will be written.\033[0m')
@@ -537,6 +698,8 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
             print('\033[94mCACHE PATH:\033[0m', cache_path)
         else:
             print('\033[94mCACHE PATH:\033[0m', tempfile.gettempdir(), '(system default)')
+        if owner:
+            print('\033[94mOWNER:\033[0m', f'{plex.owner_uid}:{plex.owner_gid}')
         print('\033[94mFORCE OVERWRITE:\033[0m', str(force))
         print('\033[94mMIRROR MODE:\033[0m', str(plex.mirror))
         print('\033[94mFORCE HASH:\033[0m', str(force_hash))
@@ -565,33 +728,56 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
                 continue
 
             item_updated = getattr(item, 'updatedAt', None)
+            is_show_library = (plex.library.type == 'show')
+
+            # Local Posters keys: show/movie title + production year. Year is required for
+            # Series/Season/Movie Primary matches (regex demands \(\d{4}\)).
+            # Per-item warning is intentionally suppressed; missing-year titles are
+            # accumulated and reported in the end-of-run summary.
+            item_title = getattr(item, 'title', None)
+            item_year = getattr(item, 'year', None)
+            if not item_year and item_title:
+                plex.unmatched_year.append(item_title)
+            show_folder = plex._lp_show_folder(item_title, item_year)
 
             # MOVIE / SHOW LEVEL ASSETS
             if (assets == 'all' or assets == 'posters') and getattr(item, 'thumb', None):
-                plex.download(item.thumb, 'poster.jpg', path, item_updated)
+                if is_show_library:
+                    rrel = f'{show_folder}/{plex._lp_series_filename(item_title, item_year)}'
+                else:
+                    rrel = plex._lp_movie_filename(item_title, item_year)
+                plex.download(item.thumb, 'poster.jpg', path, item_updated, rclone_rel=rrel)
 
             if (assets == 'all' or assets == 'backgrounds') and getattr(item, 'art', None):
-                plex.download(item.art, 'fanart.jpg', path, item_updated)
+                if is_show_library:
+                    rrel = f'{show_folder}/{plex._lp_series_filename(item_title, item_year, art_type="Backdrop")}'
+                else:
+                    rrel = plex._lp_movie_filename(item_title, item_year, art_type='Backdrop')
+                plex.download(item.art, 'fanart.jpg', path, item_updated, rclone_rel=rrel)
 
             if (assets == 'all' or assets == 'banners') and getattr(item, 'banner', None):
-                plex.download(item.banner, 'banner.jpg', path, item_updated)
+                if is_show_library:
+                    rrel = f'{show_folder}/{plex._lp_series_filename(item_title, item_year, art_type="Banner")}'
+                else:
+                    rrel = plex._lp_movie_filename(item_title, item_year, art_type='Banner')
+                plex.download(item.banner, 'banner.jpg', path, item_updated, rclone_rel=rrel)
 
+            # theme.mp3: Local Posters doesn't index audio — local only, skip rclone.
             if (assets == 'all' or assets == 'themes') and getattr(item, 'theme', None):
-                plex.download(item.theme, 'theme.mp3', path, item_updated)
+                plex.download(item.theme, 'theme.mp3', path, item_updated, rclone_rel=None)
 
             # TV SPECIFIC
-            if plex.library.type == 'show':
+            if is_show_library:
                 for season in item.seasons():
                     season_path = plex.getPath(season)
                     season_updated = getattr(season, 'updatedAt', None)
+                    season_idx = getattr(season, 'index', None) or getattr(season, 'seasonNumber', None)
+                    season_name = getattr(season, 'title', None)
 
-                    # season.episodes() is fetched once and reused below for both the
-                    # season-path fallback and the per-episode loop.
+                    # Fetch episodes once for both season-path fallback and per-episode loop.
                     episodes = list(season.episodes())
 
-                    # If plexapi didn't populate season.locations (it's unreliable
-                    # depending on how the section was indexed), derive the season's
-                    # directory from the first episode's media file path.
+                    # If plexapi didn't populate season.locations, derive from first episode's media path.
                     if not season_path and episodes:
                         for media in episodes[0].media:
                             for part in media.parts:
@@ -600,23 +786,31 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
                             if season_path:
                                 break
 
-                    # Season-level assets (only if we resolved a path)
+                    # Season Primary (folder.jpg locally; LP "Season NN" name on rclone).
+                    # Local Posters only supports Primary for seasons — backgrounds/banners
+                    # are intentionally not uploaded to rclone for season-level assets
+                    # (they still go to local in legacy media-folder names).
                     if season_path:
                         if (assets == 'all' or assets == 'posters') and getattr(season, 'thumb', None):
-                            plex.download(season.thumb, 'folder.jpg', season_path, season_updated)
+                            rrel = (f'{show_folder}/'
+                                    f'{plex._lp_season_filename(item_title, item_year, season_idx, season_name)}')
+                            plex.download(season.thumb, 'folder.jpg', season_path, season_updated, rclone_rel=rrel)
 
                         if (assets == 'all' or assets == 'backgrounds') and getattr(season, 'art', None):
-                            plex.download(season.art, 'season-fanart.jpg', season_path, season_updated)
+                            # LP doesn't support season Backdrop; local-only.
+                            plex.download(season.art, 'season-fanart.jpg', season_path, season_updated, rclone_rel=None)
 
                         if (assets == 'all' or assets == 'banners') and getattr(season, 'banner', None):
-                            plex.download(season.banner, 'season-banner.jpg', season_path, season_updated)
+                            # LP doesn't support season Banner; local-only.
+                            plex.download(season.banner, 'season-banner.jpg', season_path, season_updated, rclone_rel=None)
                     elif verbose:
-                        print(f'  [SEASON SKIP] could not resolve path for {item.title} S{getattr(season, "seasonNumber", "?"):02d}')
+                        s_disp = f'{season_idx:02d}' if isinstance(season_idx, int) else '??'
+                        print(f'  [SEASON SKIP] could not resolve path for {item_title} S{s_disp}')
 
-                    # Episode-level processing is INDEPENDENT of season_path —
-                    # each episode resolves its own directory from its media file.
+                    # Episode thumbnails — Primary only in LP.
                     for episode in episodes:
                         episode_updated = getattr(episode, 'updatedAt', None)
+                        ep_idx = getattr(episode, 'index', None)
 
                         if (assets == 'all' or assets == 'posters') and getattr(episode, 'thumb', None):
                             ep_path = None
@@ -629,10 +823,52 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
                                 if ep_path:
                                     break
                             if ep_path and ep_filename:
-                                plex.download(episode.thumb, ep_filename, ep_path, episode_updated)
+                                rrel = None
+                                if (season_idx is not None) and (ep_idx is not None):
+                                    rrel = (f'{show_folder}/'
+                                            f'{plex._lp_episode_filename(item_title, item_year, season_idx, ep_idx)}')
+                                plex.download(episode.thumb, ep_filename, ep_path, episode_updated, rclone_rel=rrel)
 
         except Exception as e:
             print(f'\033[91mERROR Processing {item.title}:\033[0m {e}')
+
+    # ---- Plex Collections (Local Posters BoxSets) ----
+    # Collections are virtual groupings in Plex — no on-disk folder. We only emit
+    # rclone artwork for them (under a "Collections/" subfolder of the rclone dest).
+    # Skip entirely if rclone isn't configured.
+    if 'rclone' in plex.export_types:
+        try:
+            collections = list(plex.library.collections())
+        except Exception as e:
+            collections = []
+            if verbose:
+                print(f'\n\033[93m[COLLECTIONS] could not enumerate:\033[0m {e}')
+
+        for col in collections:
+            try:
+                col.reload()
+            except Exception:
+                continue
+
+            col_title = getattr(col, 'title', None)
+            if not col_title:
+                continue
+
+            if verbose:
+                print(f'\n\033[94mCOLLECTION:\033[0m {col_title}')
+
+            col_updated = getattr(col, 'updatedAt', None)
+
+            try:
+                if (assets == 'all' or assets == 'posters') and getattr(col, 'thumb', None):
+                    rrel = 'Collections/' + plex._lp_collection_filename(col_title)
+                    plex.download(col.thumb, None, None, col_updated, rclone_rel=rrel)
+
+                if (assets == 'all' or assets == 'backgrounds') and getattr(col, 'art', None):
+                    rrel = 'Collections/' + plex._lp_collection_filename(col_title, art_type='Backdrop')
+                    plex.download(col.art, None, None, col_updated, rclone_rel=rrel)
+            except Exception as e:
+                print(f'\033[91mERROR Processing collection {col_title}:\033[0m {e}')
 
     # End of per-asset loop — do the single bulk rclone copy now (no-op if nothing staged)
     print()
@@ -647,10 +883,19 @@ def main(ctx, baseurl: str, token: str, library: str, assets: str, force: bool, 
         print('\033[94mTOTAL PROCESSED:\033[0m', str(plex.downloaded))
         if plex.rclone_staging is not None:
             print('\033[94mRCLONE STAGED:\033[0m', str(plex.rclone_staged))
+        if plex.unmatched_year:
+            print(f'\033[93mNO YEAR ({len(plex.unmatched_year)}):\033[0m '
+                  f'Primary images for these won\'t match Local Posters regex (Art types still work):')
+            for t in sorted(plex.unmatched_year):
+                print(f'  - {t}')
         if plex.errors:
             print('\033[91mTOTAL ERRORS:\033[0m', str(plex.errors))
 
 
 # run
 if __name__ == '__main__':
+    # Default umask of 0o077 (some containers) results in directories created at 700,
+    # which a non-root media server can't traverse. Force a sane umask up front so any
+    # directories the script creates are 755 by default.
+    os.umask(0o022)
     main(obj={})
